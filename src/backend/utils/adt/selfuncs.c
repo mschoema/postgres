@@ -2891,12 +2891,805 @@ neqjoinsel(PG_FUNCTION_ARGS)
 }
 
 /*
+ * MCV vs MCV join selectivity estimation
+ *
+ * We simply add up the fractions of the populations that satisfy the clause.
+ * The result is exact and does not need to be scaled further.
+ */
+static Selectivity
+ineq_mcv_join_sel(AttStatsSlot *mcv1_slot,
+				  AttStatsSlot *mcv2_slot,
+				  FmgrInfo *opproc, Oid collation)
+{
+	Selectivity selec = 0.0;
+	int			i,
+				j;
+
+	for (i = 0; i < mcv1_slot->nvalues; i++)
+	{
+		for (j = 0; j < mcv2_slot->nvalues; j++)
+		{
+			if (DatumGetBool(FunctionCall2Coll(opproc, collation,
+											   mcv1_slot->values[i], 
+											   mcv2_slot->values[j])))
+				selec += mcv1_slot->numbers[i] * mcv2_slot->numbers[j];
+		}
+	}
+	return selec;
+}
+
+static Selectivity
+ineq_hist_sel(PlannerInfo *root,
+			  VariableStatData *vardata,
+			  AttStatsSlot *hist_slot,
+			  Datum constval, Oid consttype,
+			  Oid opoid, FmgrInfo *opproc,
+			  Oid collation)
+{
+	double		hist_selec = 0.0;
+	
+	if (hist_slot->nvalues > 1 &&
+		hist_slot->stacoll == collation &&
+		comparison_ops_are_compatible(hist_slot->staop, opoid))
+	{
+		/*
+		 * Use binary search to find the desired location, namely the
+		 * right end of the histogram bin containing the comparison value,
+		 * which is the leftmost entry for which the comparison operator
+		 * succeeds (if isgt) or fails (if !isgt).
+		 *
+		 * In this loop, we pay no attention to whether the operator iseq
+		 * or not; that detail will be mopped up below.  (We cannot tell,
+		 * anyway, whether the operator thinks the values are equal.)
+		 *
+		 * If the binary search accesses the first or last histogram
+		 * entry, we try to replace that endpoint with the true column min
+		 * or max as found by get_actual_variable_range().  This
+		 * ameliorates misestimates when the min or max is moving as a
+		 * result of changes since the last ANALYZE.  Note that this could
+		 * result in effectively including MCVs into the histogram that
+		 * weren't there before, but we don't try to correct for that.
+		 */
+		double		histfrac;
+		int			lobound = 0;	/* first possible slot to search */
+		int			hibound = hist_slot->nvalues;	/* last+1 slot to search */
+		bool		have_end = false;
+
+		/*
+		 * If there are only two histogram entries, we'll want up-to-date
+		 * values for both.  (If there are more than two, we need at most
+		 * one of them to be updated, so we deal with that within the
+		 * loop.)
+		 */
+		if (hist_slot->nvalues == 2)
+			have_end = get_actual_variable_range(root,
+												 vardata,
+												 hist_slot->staop,
+												 collation,
+												 &hist_slot->values[0],
+												 &hist_slot->values[1]);
+
+		while (lobound < hibound)
+		{
+			int			probe = (lobound + hibound) / 2;
+			bool		ltcmp;
+
+			/*
+			 * If we find ourselves about to compare to the first or last
+			 * histogram entry, first try to replace it with the actual
+			 * current min or max (unless we already did so above).
+			 */
+			if (probe == 0 && hist_slot->nvalues > 2)
+				have_end = get_actual_variable_range(root,
+													 vardata,
+													 hist_slot->staop,
+													 collation,
+													 &hist_slot->values[0],
+													 NULL);
+			else if (probe == hist_slot->nvalues - 1 && hist_slot->nvalues > 2)
+				have_end = get_actual_variable_range(root,
+													 vardata,
+													 hist_slot->staop,
+													 collation,
+													 NULL,
+													 &hist_slot->values[probe]);
+
+			ltcmp = DatumGetBool(FunctionCall2Coll(opproc,
+												   collation,
+												   hist_slot->values[probe],
+												   constval));
+			if (isgt)
+				ltcmp = !ltcmp;
+			if (ltcmp)
+				lobound = probe + 1;
+			else
+				hibound = probe;
+		}
+
+		if (lobound <= 0)
+		{
+			/*
+			 * Constant is below lower histogram boundary.  More
+			 * precisely, we have found that no entry in the histogram
+			 * satisfies the inequality clause (if !isgt) or they all do
+			 * (if isgt).  We estimate that that's true of the entire
+			 * table, so set histfrac to 0.0 (which we'll flip to 1.0
+			 * below, if isgt).
+			 */
+			histfrac = 0.0;
+		}
+		else if (lobound >= hist_slot->nvalues)
+		{
+			/*
+			 * Inverse case: constant is above upper histogram boundary.
+			 */
+			histfrac = 1.0;
+		}
+		else
+		{
+			/* We have values[i-1] <= constant <= values[i]. */
+			int			i = lobound;
+			double		eq_selec = 0;
+			double		val,
+						high,
+						low;
+			double		binfrac;
+
+			/*
+			 * In the cases where we'll need it below, obtain an estimate
+			 * of the selectivity of "x = constval".  We use a calculation
+			 * similar to what var_eq_const() does for a non-MCV constant,
+			 * ie, estimate that all distinct non-MCV values occur equally
+			 * often.  But multiplication by "1.0 - sumcommon - nullfrac"
+			 * will be done by our caller, so we shouldn't do that here.
+			 * Therefore we can't try to clamp the estimate by reference
+			 * to the least common MCV; the result would be too small.
+			 *
+			 * Note: since this is effectively assuming that constval
+			 * isn't an MCV, it's logically dubious if constval in fact is
+			 * one.  But we have to apply *some* correction for equality,
+			 * and anyway we cannot tell if constval is an MCV, since we
+			 * don't have a suitable equality operator at hand.
+			 */
+			if (i == 1 || isgt == iseq)
+			{
+				double		otherdistinct;
+				bool		isdefault;
+				AttStatsSlot mcvslot;
+
+				/* Get estimated number of distinct values */
+				otherdistinct = get_variable_numdistinct(vardata,
+														 &isdefault);
+
+				/* Subtract off the number of known MCVs */
+				if (get_attstatsslot(&mcvslot, vardata->statsTuple,
+									 STATISTIC_KIND_MCV, InvalidOid,
+									 ATTSTATSSLOT_NUMBERS))
+				{
+					otherdistinct -= mcvslot.nnumbers;
+					free_attstatsslot(&mcvslot);
+				}
+
+				/* If result doesn't seem sane, leave eq_selec at 0 */
+				if (otherdistinct > 1)
+					eq_selec = 1.0 / otherdistinct;
+			}
+
+			/*
+			 * Convert the constant and the two nearest bin boundary
+			 * values to a uniform comparison scale, and do a linear
+			 * interpolation within this bin.
+			 */
+			if (convert_to_scalar(constval, consttype, collation,
+								  &val,
+								  hist_slot->values[i - 1], hist_slot->values[i],
+								  vardata->vartype,
+								  &low, &high))
+			{
+				if (high <= low)
+				{
+					/* cope if bin boundaries appear identical */
+					binfrac = 0.5;
+				}
+				else if (val <= low)
+					binfrac = 0.0;
+				else if (val >= high)
+					binfrac = 1.0;
+				else
+				{
+					binfrac = (val - low) / (high - low);
+
+					/*
+					 * Watch out for the possibility that we got a NaN or
+					 * Infinity from the division.  This can happen
+					 * despite the previous checks, if for example "low"
+					 * is -Infinity.
+					 */
+					if (isnan(binfrac) ||
+						binfrac < 0.0 || binfrac > 1.0)
+						binfrac = 0.5;
+				}
+			}
+			else
+			{
+				/*
+				 * Ideally we'd produce an error here, on the grounds that
+				 * the given operator shouldn't have scalarXXsel
+				 * registered as its selectivity func unless we can deal
+				 * with its operand types.  But currently, all manner of
+				 * stuff is invoking scalarXXsel, so give a default
+				 * estimate until that can be fixed.
+				 */
+				binfrac = 0.5;
+			}
+
+			/*
+			 * Now, compute the overall selectivity across the values
+			 * represented by the histogram.  We have i-1 full bins and
+			 * binfrac partial bin below the constant.
+			 */
+			histfrac = (double) (i - 1) + binfrac;
+			histfrac /= (double) (hist_slot->nvalues - 1);
+
+			/*
+			 * At this point, histfrac is an estimate of the fraction of
+			 * the population represented by the histogram that satisfies
+			 * "x <= constval".  Somewhat remarkably, this statement is
+			 * true regardless of which operator we were doing the probes
+			 * with, so long as convert_to_scalar() delivers reasonable
+			 * results.  If the probe constant is equal to some histogram
+			 * entry, we would have considered the bin to the left of that
+			 * entry if probing with "<" or ">=", or the bin to the right
+			 * if probing with "<=" or ">"; but binfrac would have come
+			 * out as 1.0 in the first case and 0.0 in the second, leading
+			 * to the same histfrac in either case.  For probe constants
+			 * between histogram entries, we find the same bin and get the
+			 * same estimate with any operator.
+			 *
+			 * The fact that the estimate corresponds to "x <= constval"
+			 * and not "x < constval" is because of the way that ANALYZE
+			 * constructs the histogram: each entry is, effectively, the
+			 * rightmost value in its sample bucket.  So selectivity
+			 * values that are exact multiples of 1/(histogram_size-1)
+			 * should be understood as estimates including a histogram
+			 * entry plus everything to its left.
+			 *
+			 * However, that breaks down for the first histogram entry,
+			 * which necessarily is the leftmost value in its sample
+			 * bucket.  That means the first histogram bin is slightly
+			 * narrower than the rest, by an amount equal to eq_selec.
+			 * Another way to say that is that we want "x <= leftmost" to
+			 * be estimated as eq_selec not zero.  So, if we're dealing
+			 * with the first bin (i==1), rescale to make that true while
+			 * adjusting the rest of that bin linearly.
+			 */
+			if (i == 1)
+				histfrac += eq_selec * (1.0 - binfrac);
+
+			/*
+			 * "x <= constval" is good if we want an estimate for "<=" or
+			 * ">", but if we are estimating for "<" or ">=", we now need
+			 * to decrease the estimate by eq_selec.
+			 */
+			if (isgt == iseq)
+				histfrac -= eq_selec;
+		}
+
+		/*
+		 * Now the estimate is finished for "<" and "<=" cases.  If we are
+		 * estimating for ">" or ">=", flip it.
+		 */
+		hist_selec = isgt ? (1.0 - histfrac) : histfrac;
+
+		/*
+		 * The histogram boundaries are only approximate to begin with,
+		 * and may well be out of date anyway.  Therefore, don't believe
+		 * extremely small or large selectivity estimates --- unless we
+		 * got actual current endpoint values from the table, in which
+		 * case just do the usual sanity clamp.  Somewhat arbitrarily, we
+		 * set the cutoff for other cases at a hundredth of the histogram
+		 * resolution.
+		 */
+		if (have_end)
+			CLAMP_PROBABILITY(hist_selec);
+		else
+		{
+			double		cutoff = 0.01 / (double) (hist_slot->nvalues - 1);
+
+			if (hist_selec < cutoff)
+				hist_selec = cutoff;
+			else if (hist_selec > 1.0 - cutoff)
+				hist_selec = 1.0 - cutoff;
+		}
+	}
+	else if (hist_slot->nvalues > 1)
+	{
+		/*
+		 * If we get here, we have a histogram but it's not sorted the way
+		 * we want.  Do a brute-force search to see how many of the
+		 * entries satisfy the comparison condition, and take that
+		 * fraction as our estimate.  (This is identical to the inner loop
+		 * of histogram_selectivity; maybe share code?)
+		 */
+		LOCAL_FCINFO(fcinfo, 2);
+		int			nmatch = 0;
+
+		InitFunctionCallInfoData(*fcinfo, opproc, 2, collation,
+								 NULL, NULL);
+		fcinfo->args[0].isnull = false;
+		fcinfo->args[1].isnull = false;
+		fcinfo->args[1].value = constval;
+		for (int i = 0; i < hist_slot->nvalues; i++)
+		{
+			Datum		fresult;
+
+			fcinfo->args[0].value = hist_slot->values[i];
+			fcinfo->isnull = false;
+			fresult = FunctionCallInvoke(fcinfo);
+			if (!fcinfo->isnull && DatumGetBool(fresult))
+				nmatch++;
+		}
+		hist_selec = ((double) nmatch) / ((double) hist_slot->nvalues);
+
+		/*
+		 * As above, clamp to a hundredth of the histogram resolution.
+		 * This case is surely even less trustworthy than the normal one,
+		 * so we shouldn't believe exact 0 or 1 selectivity.  (Maybe the
+		 * clamp should be more restrictive in this case?)
+		 */
+		{
+			double		cutoff = 0.01 / (double) (hist_slot->nvalues - 1);
+
+			if (hist_selec < cutoff)
+				hist_selec = cutoff;
+			else if (hist_selec > 1.0 - cutoff)
+				hist_selec = 1.0 - cutoff;
+		}
+	}
+
+	return hist_selec;
+}
+
+/*
+ * Inet MCV vs histogram join selectivity estimation
+ *
+ * For each MCV on the lefthand side, estimate the fraction of the righthand's
+ * histogram population that satisfies the join clause, and add those up,
+ * scaling by the MCV's frequency.  The result still needs to be scaled
+ * according to the fraction of the righthand's population represented by
+ * the histogram.
+ */
+static Selectivity
+ineq_hist_mcv_sel(PlannerInfo *root,
+				  VariableStatData *hist_vardata,
+			  	  AttStatsSlot *hist_slot,
+				  AttStatsSlot *mcv_slot,
+				  Oid opoid, FmgrInfo *opproc,
+				  Oid collation)
+{
+	Selectivity selec = 0.0;
+	int			i;
+
+	for (i = 0; i < mcv_slot->nvalues; i++)
+		selec += mcv_slot->numbers[i] * 
+			ineq_hist_sel(root, 
+						  hist_vardata, hist_slot, 
+						  mcv_slot->values[i], 
+						  mcv_slot->valuetype,
+						  opoid, opproc, collation);
+	return selec;
+}
+
+/*
+ * Inet histogram vs histogram join selectivity estimation
+ *
+ * Here, we take all values listed in the second histogram (except for the
+ * first and last elements, which are excluded on the grounds of possibly
+ * not being very representative) and treat them as a uniform sample of
+ * the non-MCV population for that relation.  For each one, we apply
+ * inet_hist_value_selec to see what fraction of the first histogram
+ * it matches.
+ *
+ * We could alternatively do this the other way around using the operator's
+ * commutator.  XXX would it be worthwhile to do it both ways and take the
+ * average?  That would at least avoid non-commutative estimation results.
+ */
+// static Selectivity
+// ineq_hist_join_sel(Datum *hist1_values, int hist1_nvalues,
+// 				   Datum *hist2_values, int hist2_nvalues,
+// 				   FMgrInfo *opproc, FMgrInfo *comm_proc,
+// 				   FmgrInfo *cmp_proc, Oid collation, bool iseq)
+// {
+// 	Selectivity selectivity = 0.0,	/* initialization */
+// 				prev_sel1 = -1.0,	/* to skip the first iteration */
+// 				prev_sel2 = 0.0;	/* initialization */
+// 	int			i,
+// 				j;
+
+// 	/*
+// 	 * Histograms will never be empty. In fact, a histogram will never have
+// 	 * less than 2 values (1 bin)
+// 	 */
+// 	Assert(hist1_nvalues > 1);
+// 	Assert(hist2_nvalues > 1);
+
+// 	/* Fast-forwards i and j to start of iteration */
+// 	for (i = 0; i < hist1_nvalues && 
+// 		DatumGetInt32(FunctionCall2Coll(opproc, 
+// 										collation, 
+// 										hist1_values[i], 
+// 										hist2_values[0])) < 0; i++);
+// 	for (j = 0; j < hist2_nvalues && 
+// 		DatumGetInt32(FunctionCall2Coll(opproc, 
+// 										collation, 
+// 										hist1_values[0], 
+// 										hist2_values[j])) >= 0; j++);
+
+// 	/* Do the estimation on overlapping regions */
+// 	while (i < hist1_nvalues && j < hist2_nvalues)
+// 	{
+// 		double		cur_sel1,
+// 					cur_sel2;
+// 		RangeBound	cur_sync;
+// 		int cmp;
+
+// 		cmp = DatumGetInt32(FunctionCall2Coll(opproc, 
+// 											  collation, 
+// 											  hist1_values[i], 
+// 											  hist2_values[j]))
+// 		if (cmp < 0)
+// 			cur_sync = hist1[i++];
+// 		else if (cmp > 0)
+// 			cur_sync = hist2[j++];
+// 		else
+// 		{
+// 			/* If equal, skip one */
+// 			cur_sync = hist1[i];
+// 			i++;
+// 			j++;
+// 		}
+// 		cur_sel1 = calc_hist_selectivity_scalar(typcache, &cur_sync,
+// 												hist1, hist1_nvalues, false);
+// 		cur_sel2 = calc_hist_selectivity_scalar(typcache, &cur_sync,
+// 												hist2, hist2_nvalues, false);
+
+// 		/* Skip the first iteration */
+// 		if (prev_sel1 >= 0)
+// 			selectivity += (prev_sel1 + cur_sel1) * (cur_sel2 - prev_sel2);
+
+// 		/* Prepare for the next iteration */
+// 		prev_sel1 = cur_sel1;
+// 		prev_sel2 = cur_sel2;
+// 	}
+
+// 	/* P(X < Y) = 0.5 * Sum(...) */
+// 	selectivity /= 2;
+
+// 	/* Include remainder of hist2 if any */
+// 	if (j < hist2_nvalues)
+// 		selectivity += 1 - prev_sel2;
+
+// 	return selectivity;
+// }
+
+static Selectivity
+ineq_hist_join_sel_bf(PlannerInfo *root,
+					  VariableStatData *hist1_vardata,
+				  	  AttStatsSlot *hist1_slot,
+					  AttStatsSlot *hist2_slot,
+					  Oid opoid, FmgrInfo *opproc, 
+					  Oid collation)
+{
+	double		match = 0.0;
+	int			i,
+				k,
+				n;
+
+	if (hist2_slot->nvalues <= 2)
+		return 0.0;				/* no interior histogram elements */
+
+	/* if there are too many histogram elements, decimate to limit runtime */
+	// k = (hist2_slot->nvalues - 3) / MAX_CONSIDERED_ELEMS + 1;
+	k = 1;
+
+	n = 0;
+	for (i = 1; i < hist2_slot->nvalues - 1; i += k)
+	{
+		match += ineq_hist_sel(root,
+							   hist1_vardata, hist1_slot, 
+							   hist2_slot->values[i],
+							   hist2_slot->valuetype,
+							   opoid, opproc, collation);
+		n++;
+	}
+
+	return match / n;
+}
+
+/*
+ * Compute the fraction of a relation's population that is represented
+ * by the MCV list.
+ */
+static Selectivity
+mcv_population(float4 *mcv_numbers, int mcv_nvalues)
+{
+	Selectivity sumcommon = 0.0;
+	int			i;
+
+	for (i = 0; i < mcv_nvalues; i++)
+	{
+		sumcommon += mcv_numbers[i];
+	}
+
+	return sumcommon;
+}
+
+/*
+ * Inner join selectivity estimation for subnet inclusion/overlap operators
+ *
+ * Calculates MCV vs MCV, MCV vs histogram and histogram vs histogram
+ * selectivity for join using the subnet inclusion operators.  Unlike the
+ * join selectivity function for the equality operator, eqjoinsel_inner(),
+ * one to one matching of the values is not enough.  Network inclusion
+ * operators are likely to match many to many, so we must check all pairs.
+ * (Note: it might be possible to exploit understanding of the histogram's
+ * btree ordering to reduce the work needed, but we don't currently try.)
+ * Also, MCV vs histogram selectivity is not neglected as in eqjoinsel_inner().
+ */
+static Selectivity
+scalarineqjoinsel_inner(PlannerInfo *root,
+						Oid operator, bool isgt, bool iseq, Oid collation,
+						VariableStatData *vardata1, VariableStatData *vardata2)
+{
+	Form_pg_statistic stats;
+	Oid 		comm_op = get_commutator(operator);
+	FmgrInfo	opproc,
+				comm_opproc;
+	double		nullfrac1 = 0.0,
+				nullfrac2 = 0.0;
+	Selectivity selec = 0.0,
+				sumcommon1 = 0.0,
+				sumcommon2 = 0.0;
+	bool		mcv1_exists = false,
+				mcv2_exists = false,
+				hist1_exists = false,
+				hist2_exists = false;
+	int			mcv1_length = 0,
+				mcv2_length = 0;
+	AttStatsSlot mcv1_slot;
+	AttStatsSlot mcv2_slot;
+	AttStatsSlot hist1_slot;
+	AttStatsSlot hist2_slot;
+
+	fmgr_info(get_opcode(operator), &opproc);
+	/* TODO: What to do if we don't have a commutator */
+	if (comm_op == InvalidOid)
+		return DEFAULT_INEQ_SEL;
+	fmgr_info(get_opcode(operator), &comm_opproc);
+
+	/*
+	 * No stats are available.  Fall back on the default estimate.
+	 */
+	if (!HeapTupleIsValid(vardata1->statsTuple) ||
+		!HeapTupleIsValid(vardata2->statsTuple) ||
+		!statistic_proc_security_check(vardata1, opproc->fn_oid) ||
+		!statistic_proc_security_check(vardata2, opproc->fn_oid))
+		return DEFAULT_INEQ_SEL;
+
+	stats = (Form_pg_statistic) GETSTRUCT(vardata1->statsTuple);
+	nullfrac1 = stats->stanullfrac;
+
+	mcv1_exists = get_attstatsslot(&mcv1_slot, vardata1->statsTuple,
+								   STATISTIC_KIND_MCV, InvalidOid,
+								   ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS);
+	hist1_exists = get_attstatsslot(&hist1_slot, vardata1->statsTuple,
+									STATISTIC_KIND_HISTOGRAM, InvalidOid,
+									ATTSTATSSLOT_VALUES);
+	/* Arbitrarily limit number of MCVs considered */
+	// mcv1_length = Min(mcv1_slot.nvalues, MAX_CONSIDERED_ELEMS);
+	mcv1_length = mcv1_slot.nvalues;
+	if (mcv1_exists)
+		sumcommon1 = mcv_population(mcv1_slot.numbers, mcv1_length);
+
+	stats = (Form_pg_statistic) GETSTRUCT(vardata2->statsTuple);
+	nullfrac2 = stats->stanullfrac;
+
+	mcv2_exists = get_attstatsslot(&mcv2_slot, vardata2->statsTuple,
+								   STATISTIC_KIND_MCV, InvalidOid,
+								   ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS);
+	hist2_exists = get_attstatsslot(&hist2_slot, vardata2->statsTuple,
+									STATISTIC_KIND_HISTOGRAM, InvalidOid,
+									ATTSTATSSLOT_VALUES);
+	/* Arbitrarily limit number of MCVs considered */
+	// mcv2_length = Min(mcv2_slot.nvalues, MAX_CONSIDERED_ELEMS);
+	mcv2_length = mcv2_slot.nvalues;
+	if (mcv2_exists)
+		sumcommon2 = mcv_population(mcv2_slot.numbers, mcv2_length);
+
+	/*
+	 * Calculate selectivity for MCV vs MCV matches.
+	 */
+	if (mcv1_exists && mcv2_exists)
+		selec += ineq_mcv_join_sel(&mcv1_slot, &mcv2_slot,
+								   &opproc, collation);
+
+	/*
+	 * Add in selectivities for MCV vs histogram matches, scaling according to
+	 * the fractions of the populations represented by the histograms. Note
+	 * that the second case needs to commute the operator.
+	 */
+	if (mcv1_exists && hist2_exists)
+		selec += (1.0 - nullfrac2 - sumcommon2) *
+			ineq_hist_mcv_sel(root, vardata1,
+							  &hist1_slot, &mcv2_slot
+							  operator, &opproc, collation);
+
+	if (mcv2_exists && hist1_exists)
+		selec += (1.0 - nullfrac1 - sumcommon1) *
+			ineq_hist_mcv_sel(root, vardata2,
+							  &hist2_slot, &mcv1_slot,
+							  operator, &comm_opproc, collation);
+
+	/*
+	 * Add in selectivity for histogram vs histogram matches, again scaling
+	 * appropriately.
+	 */
+	if (hist1_exists && hist2_exists)
+	{
+		Selectivity	hist_selec;
+		Oid			cmp_oper = InvalidOid;
+		// FmgrInfo	cmp_proc;
+		// List 	   *opinfos;
+		// ListCell   *lc;
+		
+		/* Attempt to find a suitable comparison operator */
+		// opinfos = get_op_btree_interpretation(operator);
+		// foreach(lc, opinfos)
+		// {
+		// 	OpBtreeInterpretation *opinfo = (OpBtreeInterpretation *) lfirst(lc);
+
+		// 	/* Skip if it is not the correct strategy number */
+		// 	switch (opinfo->strategy)
+		// 	{
+		// 		case BTLessStrategyNumber:
+		// 			if (isgt || iseq) continue;
+		// 			break;
+		// 		case BTLessEqualStrategyNumber:
+		// 			if (isgt || !iseq) continue;
+		// 			break;
+		// 		case BTGreaterStrategyNumber:
+		// 			if (!isgt || iseq) continue;
+		// 			break;
+		// 		case BTGreaterEqualStrategyNumber:
+		// 			if (!isgt || !iseq) continue;
+		// 			break;
+		// 		default:
+		// 			continue;
+		// 	}
+
+		// 	/* Try to find a cmp function */
+		// 	cmp_oper = get_opfamily_proc(opinfo->opfamily_id,
+		// 								 hist1_slot.valuetype,
+		// 								 hist2_slot.valuetype,
+		// 								 BTORDER_PROC);
+		// 	if (!OidIsValid(cmp_oper))
+		// 		continue;
+
+		// 	/* Found a suitable operator */
+		// 	fmgr_info(cmp_oper, &cmp_proc);
+		// 	break;
+		// }
+
+		if (false && cmp_oper != InvalidOid)
+		{
+			Selectivity	lt_selec;
+						// eq_selec;
+
+			lt_selec = 0;
+			// lt_selec = ineq_hist_join_sel(hist1_slot.values,
+			// 							  hist1_slot.nvalues,
+			// 							  hist2_slot.values,
+			// 							  hist2_slot.nvalues,
+			// 							  &cmp_proc, collation,
+			// 							  isgt != iseq);
+			if (!isgt) /* sel(H1 < H2) */
+				hist_selec = lt_selec;
+			else /* sel(H1 > H2) = 1 - sel(H1 <= H2) */
+				hist_selec = 1 - lt_selec;
+		}
+		else
+			hist_selec = ineq_hist_join_sel_bf(root, vardata1,
+											   &hist1_slot, &hist2_slot,
+											   operator, &opproc, collation);
+		selec += (1.0 - nullfrac1 - sumcommon1) *
+			(1.0 - nullfrac2 - sumcommon2) * hist_selec;
+	}
+
+	/*
+	 * If useful statistics are not available then use the default estimate.
+	 * We can apply null fractions if known, though.
+	 */
+	if ((!mcv1_exists && !hist1_exists) || (!mcv2_exists && !hist2_exists))
+		selec = (1.0 - nullfrac1) * (1.0 - nullfrac2) * DEFAULT_INEQ_SEL;
+
+	/* Release stats. */
+	free_attstatsslot(&mcv1_slot);
+	free_attstatsslot(&mcv2_slot);
+	free_attstatsslot(&hist1_slot);
+	free_attstatsslot(&hist2_slot);
+
+	return selec;
+}
+
+/*
+ * Common wrapper function for the selectivity estimators that simply
+ * invoke scalarineqsel().
+ */
+static Datum
+scalarineqjoinsel_wrapper(PG_FUNCTION_ARGS, bool isgt, bool iseq)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	Oid			operator = PG_GETARG_OID(1);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+#ifdef NOT_USED
+	JoinType	jointype = (JoinType) PG_GETARG_INT16(3);
+#endif
+	SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) PG_GETARG_POINTER(4);
+	Oid			collation = PG_GET_COLLATION();
+	double		selec;
+	VariableStatData vardata1;
+	VariableStatData vardata2;
+	bool		join_is_reversed;
+
+	get_join_variables(root, args, sjinfo,
+					   &vardata1, &vardata2, &join_is_reversed);
+
+	switch (sjinfo->jointype)
+	{
+		case JOIN_INNER:
+		case JOIN_LEFT:
+		case JOIN_FULL:
+		case JOIN_SEMI:
+		case JOIN_ANTI:
+			/*
+			 * Selectivity for left/full join is not exactly the same as inner
+			 * join, but we neglect the difference, as eqjoinsel does.
+			 */
+			selec = scalarineqjoinsel_inner(root, operator, isgt, iseq, collation, 
+				&vardata1, &vardata2);
+			break;
+		// case JOIN_SEMI:
+		// case JOIN_ANTI:
+			// /* Here, it's important that we pass the outer var on the left. */
+			// if (!join_is_reversed)
+			// 	selec = scalarineqjoinsel_semi(operator, &vardata1, &vardata2);
+			// else
+			// 	selec = scalarineqjoinsel_semi(get_commutator(operator),
+			// 								&vardata2, &vardata1);
+			// break;
+		default:
+			/* other values not expected here */
+			elog(ERROR, "unrecognized join type: %d",
+				 (int) sjinfo->jointype);
+			selec = 0;			/* keep compiler quiet */
+			break;
+	}
+
+	ReleaseVariableStats(vardata1);
+	ReleaseVariableStats(vardata2);
+
+	CLAMP_PROBABILITY(selec);
+
+	PG_RETURN_FLOAT8((float8) selec);
+}
+
+/*
  *		scalarltjoinsel - Join selectivity of "<" for scalars
  */
 Datum
 scalarltjoinsel(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_FLOAT8(DEFAULT_INEQ_SEL);
+	return scalarineqjoinsel_wrapper(fcinfo, false, false);
 }
 
 /*
@@ -2905,7 +3698,7 @@ scalarltjoinsel(PG_FUNCTION_ARGS)
 Datum
 scalarlejoinsel(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_FLOAT8(DEFAULT_INEQ_SEL);
+	return scalarineqjoinsel_wrapper(fcinfo, false, true);
 }
 
 /*
@@ -2914,7 +3707,7 @@ scalarlejoinsel(PG_FUNCTION_ARGS)
 Datum
 scalargtjoinsel(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_FLOAT8(DEFAULT_INEQ_SEL);
+	return scalarineqjoinsel_wrapper(fcinfo, true, false);
 }
 
 /*
@@ -2923,7 +3716,7 @@ scalargtjoinsel(PG_FUNCTION_ARGS)
 Datum
 scalargejoinsel(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_FLOAT8(DEFAULT_INEQ_SEL);
+	return scalarineqjoinsel_wrapper(fcinfo, true, true);
 }
 
 
